@@ -1585,3 +1585,814 @@ int xbdev_md_manage(const char *md_name, int cmd, void *cmd_arg)
     
     return rc;
 }
+
+/**
+ * RAID设备替换磁盘
+ * 在SPDK线程中执行
+ */
+static void xbdev_md_replace_disk_on_thread(void *arg)
+{
+    struct {
+        const char *md_name;
+        const char *old_disk;
+        const char *new_disk;
+        bool auto_rebuild;
+        int rc;
+        bool done;
+    } *ctx = arg;
+    
+    int raid_idx;
+    xbdev_md_dev_t *md_dev;
+    
+    // 参数检查
+    if (!ctx->md_name || !ctx->old_disk || !ctx->new_disk) {
+        ctx->rc = -EINVAL;
+        ctx->done = true;
+        return;
+    }
+    
+    // 查找RAID设备
+    pthread_mutex_lock(&g_md_mutex);
+    raid_idx = find_md_by_name(ctx->md_name);
+    if (raid_idx < 0) {
+        pthread_mutex_unlock(&g_md_mutex);
+        XBDEV_ERRLOG("找不到RAID设备: %s\n", ctx->md_name);
+        ctx->rc = -ENOENT;
+        ctx->done = true;
+        return;
+    }
+    
+    md_dev = &g_md_devices[raid_idx];
+    pthread_mutex_lock(&md_dev->lock);
+    pthread_mutex_unlock(&g_md_mutex);
+    
+    // 查找要替换的磁盘
+    int disk_idx = -1;
+    for (int i = 0; i < md_dev->disk_count; i++) {
+        if (md_dev->disk_names[i] && strcmp(md_dev->disk_names[i], ctx->old_disk) == 0) {
+            disk_idx = i;
+            break;
+        }
+    }
+    
+    if (disk_idx < 0) {
+        pthread_mutex_unlock(&md_dev->lock);
+        XBDEV_ERRLOG("找不到要替换的磁盘: %s\n", ctx->old_disk);
+        ctx->rc = -ENOENT;
+        ctx->done = true;
+        return;
+    }
+    
+    // 检查新磁盘是否存在
+    struct spdk_bdev *new_bdev = spdk_bdev_get_by_name(ctx->new_disk);
+    if (!new_bdev) {
+        pthread_mutex_unlock(&md_dev->lock);
+        XBDEV_ERRLOG("找不到新磁盘: %s\n", ctx->new_disk);
+        ctx->rc = -ENODEV;
+        ctx->done = true;
+        return;
+    }
+    
+    // 替换磁盘
+    ctx->rc = spdk_bdev_raid_remove_base_device(ctx->md_name, disk_idx);
+    if (ctx->rc != 0) {
+        pthread_mutex_unlock(&md_dev->lock);
+        XBDEV_ERRLOG("移除基础设备失败: %s, rc=%d\n", ctx->old_disk, ctx->rc);
+        ctx->done = true;
+        return;
+    }
+    
+    ctx->rc = spdk_bdev_raid_add_base_device(ctx->md_name, ctx->new_disk, disk_idx);
+    if (ctx->rc != 0) {
+        pthread_mutex_unlock(&md_dev->lock);
+        XBDEV_ERRLOG("添加新基础设备失败: %s, rc=%d\n", ctx->new_disk, ctx->rc);
+        ctx->done = true;
+        return;
+    }
+    
+    // 更新MD设备状态
+    free(md_dev->disk_names[disk_idx]);
+    md_dev->disk_names[disk_idx] = strdup(ctx->new_disk);
+    md_dev->disk_state[disk_idx] = true;
+    
+    // 如果有故障盘被替换，更新计数
+    if (md_dev->failed_disk_count > 0) {
+        md_dev->failed_disk_count--;
+    }
+    
+    // 如果没有更多故障盘，标记为非降级状态
+    if (md_dev->failed_disk_count == 0 && !ctx->auto_rebuild) {
+        md_dev->degraded = false;
+    }
+    
+    // 如果启用自动重建，启动重建过程
+    if (ctx->auto_rebuild) {
+        md_dev->rebuild_active = true;
+        md_dev->rebuild_progress = 0.0;
+    }
+    
+    pthread_mutex_unlock(&md_dev->lock);
+    
+    XBDEV_NOTICELOG("成功替换RAID设备磁盘: %s, 旧磁盘: %s, 新磁盘: %s\n",
+                  ctx->md_name, ctx->old_disk, ctx->new_disk);
+    
+    ctx->rc = 0;
+    ctx->done = true;
+}
+
+/**
+ * 替换RAID设备中的磁盘
+ * 
+ * @param md_name RAID设备名称
+ * @param old_disk 旧磁盘名称
+ * @param new_disk 新磁盘名称
+ * @param auto_rebuild 是否自动启动重建
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_replace_disk(const char *md_name, const char *old_disk,
+                         const char *new_disk, bool auto_rebuild)
+{
+    xbdev_request_t *req;
+    struct {
+        const char *md_name;
+        const char *old_disk;
+        const char *new_disk;
+        bool auto_rebuild;
+        int rc;
+        bool done;
+    } ctx = {0};
+    int rc;
+    
+    // 参数检查
+    if (!md_name || !old_disk || !new_disk) {
+        XBDEV_ERRLOG("无效的参数\n");
+        return -EINVAL;
+    }
+    
+    // 设置上下文
+    ctx.md_name = md_name;
+    ctx.old_disk = old_disk;
+    ctx.new_disk = new_disk;
+    ctx.auto_rebuild = auto_rebuild;
+    ctx.rc = 0;
+    ctx.done = false;
+    
+    // 分配请求
+    req = xbdev_sync_request_alloc();
+    if (!req) {
+        XBDEV_ERRLOG("无法分配请求\n");
+        return -ENOMEM;
+    }
+    
+    // 设置请求类型
+    req->type = XBDEV_REQ_RAID_REPLACE_DISK;
+    req->ctx = &ctx;
+    
+    // 提交请求并等待完成
+    rc = xbdev_sync_request_execute(req);
+    if (rc != 0) {
+        XBDEV_ERRLOG("执行同步请求失败: %d\n", rc);
+        xbdev_sync_request_free(req);
+        return rc;
+    }
+    
+    // 检查操作结果
+    rc = ctx.rc;
+    if (rc != 0) {
+        XBDEV_ERRLOG("替换RAID设备磁盘失败: %s, rc=%d\n", md_name, rc);
+    }
+    
+    // 释放请求
+    xbdev_sync_request_free(req);
+    
+    return rc;
+}
+
+/**
+ * 控制RAID重建过程
+ * 在SPDK线程中执行
+ */
+static void xbdev_md_rebuild_control_on_thread(void *arg)
+{
+    struct {
+        const char *md_name;
+        bool start;
+        uint32_t speed_limit_kb;
+        int rc;
+        bool done;
+    } *ctx = arg;
+    
+    int raid_idx;
+    xbdev_md_dev_t *md_dev;
+    
+    // 参数检查
+    if (!ctx->md_name) {
+        ctx->rc = -EINVAL;
+        ctx->done = true;
+        return;
+    }
+    
+    // 查找RAID设备
+    pthread_mutex_lock(&g_md_mutex);
+    raid_idx = find_md_by_name(ctx->md_name);
+    if (raid_idx < 0) {
+        pthread_mutex_unlock(&g_md_mutex);
+        XBDEV_ERRLOG("找不到RAID设备: %s\n", ctx->md_name);
+        ctx->rc = -ENOENT;
+        ctx->done = true;
+        return;
+    }
+    
+    md_dev = &g_md_devices[raid_idx];
+    pthread_mutex_lock(&md_dev->lock);
+    pthread_mutex_unlock(&g_md_mutex);
+    
+    // 控制重建过程
+    if (ctx->start) {
+        // 启动重建
+        if (md_dev->rebuild_active) {
+            pthread_mutex_unlock(&md_dev->lock);
+            XBDEV_WARNLOG("RAID设备重建已在进行中: %s\n", ctx->md_name);
+            ctx->rc = -EALREADY;
+            ctx->done = true;
+            return;
+        }
+        
+        if (!md_dev->degraded) {
+            pthread_mutex_unlock(&md_dev->lock);
+            XBDEV_ERRLOG("RAID设备未处于降级状态，无需重建: %s\n", ctx->md_name);
+            ctx->rc = -EINVAL;
+            ctx->done = true;
+            return;
+        }
+        
+        // 设置重建状态
+        md_dev->rebuild_active = true;
+        md_dev->rebuild_progress = 0.0;
+        md_dev->rebuild_speed_kb = ctx->speed_limit_kb;
+        
+        // 在实际实现中，还需要启动重建任务
+        // 此处为示例，简化处理
+        
+        XBDEV_NOTICELOG("启动RAID设备重建: %s\n", ctx->md_name);
+    } else {
+        // 停止重建
+        if (!md_dev->rebuild_active) {
+            pthread_mutex_unlock(&md_dev->lock);
+            XBDEV_WARNLOG("RAID设备重建未在进行中: %s\n", ctx->md_name);
+            ctx->rc = -EALREADY;
+            ctx->done = true;
+            return;
+        }
+        
+        // 设置重建状态
+        md_dev->rebuild_active = false;
+        
+        // 在实际实现中，还需要停止重建任务
+        // 此处为示例，简化处理
+        
+        XBDEV_NOTICELOG("停止RAID设备重建: %s\n", ctx->md_name);
+    }
+    
+    pthread_mutex_unlock(&md_dev->lock);
+    
+    ctx->rc = 0;
+    ctx->done = true;
+}
+
+/**
+ * 启动RAID重建过程
+ * 
+ * @param md_name RAID设备名称
+ * @param speed_limit_kb 重建速度限制(KB/s)，0表示不限制
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_start_rebuild(const char *md_name, uint32_t speed_limit_kb)
+{
+    xbdev_request_t *req;
+    struct {
+        const char *md_name;
+        bool start;
+        uint32_t speed_limit_kb;
+        int rc;
+        bool done;
+    } ctx = {0};
+    int rc;
+    
+    // 参数检查
+    if (!md_name) {
+        XBDEV_ERRLOG("无效的RAID名称\n");
+        return -EINVAL;
+    }
+    
+    // 设置上下文
+    ctx.md_name = md_name;
+    ctx.start = true;
+    ctx.speed_limit_kb = speed_limit_kb;
+    ctx.rc = 0;
+    ctx.done = false;
+    
+    // 分配请求
+    req = xbdev_sync_request_alloc();
+    if (!req) {
+        XBDEV_ERRLOG("无法分配请求\n");
+        return -ENOMEM;
+    }
+    
+    // 设置请求类型
+    req->type = XBDEV_REQ_RAID_REBUILD_CONTROL;
+    req->ctx = &ctx;
+    
+    // 提交请求并等待完成
+    rc = xbdev_sync_request_execute(req);
+    if (rc != 0) {
+        XBDEV_ERRLOG("执行同步请求失败: %d\n", rc);
+        xbdev_sync_request_free(req);
+        return rc;
+    }
+    
+    // 检查操作结果
+    rc = ctx.rc;
+    if (rc != 0) {
+        XBDEV_ERRLOG("启动RAID设备重建失败: %s, rc=%d\n", md_name, rc);
+    }
+    
+    // 释放请求
+    xbdev_sync_request_free(req);
+    
+    return rc;
+}
+
+/**
+ * 停止RAID重建过程
+ * 
+ * @param md_name RAID设备名称
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_stop_rebuild(const char *md_name)
+{
+    xbdev_request_t *req;
+    struct {
+        const char *md_name;
+        bool start;
+        uint32_t speed_limit_kb;
+        int rc;
+        bool done;
+    } ctx = {0};
+    int rc;
+    
+    // 参数检查
+    if (!md_name) {
+        XBDEV_ERRLOG("无效的RAID名称\n");
+        return -EINVAL;
+    }
+    
+    // 设置上下文
+    ctx.md_name = md_name;
+    ctx.start = false;
+    ctx.speed_limit_kb = 0;
+    ctx.rc = 0;
+    ctx.done = false;
+    
+    // 分配请求
+    req = xbdev_sync_request_alloc();
+    if (!req) {
+        XBDEV_ERRLOG("无法分配请求\n");
+        return -ENOMEM;
+    }
+    
+    // 设置请求类型
+    req->type = XBDEV_REQ_RAID_REBUILD_CONTROL;
+    req->ctx = &ctx;
+    
+    // 提交请求并等待完成
+    rc = xbdev_sync_request_execute(req);
+    if (rc != 0) {
+        XBDEV_ERRLOG("执行同步请求失败: %d\n", rc);
+        xbdev_sync_request_free(req);
+        return rc;
+    }
+    
+    // 检查操作结果
+    rc = ctx.rc;
+    if (rc != 0) {
+        XBDEV_ERRLOG("停止RAID设备重建失败: %s, rc=%d\n", md_name, rc);
+    }
+    
+    // 释放请求
+    xbdev_sync_request_free(req);
+    
+    return rc;
+}
+
+/**
+ * 设置磁盘故障状态
+ * 在SPDK线程中执行
+ */
+static void xbdev_md_set_disk_state_on_thread(void *arg)
+{
+    struct {
+        const char *md_name;
+        const char *disk_name;
+        bool is_faulty;
+        int rc;
+        bool done;
+    } *ctx = arg;
+    
+    int raid_idx;
+    xbdev_md_dev_t *md_dev;
+    
+    // 参数检查
+    if (!ctx->md_name || !ctx->disk_name) {
+        ctx->rc = -EINVAL;
+        ctx->done = true;
+        return;
+    }
+    
+    // 查找RAID设备
+    pthread_mutex_lock(&g_md_mutex);
+    raid_idx = find_md_by_name(ctx->md_name);
+    if (raid_idx < 0) {
+        pthread_mutex_unlock(&g_md_mutex);
+        XBDEV_ERRLOG("找不到RAID设备: %s\n", ctx->md_name);
+        ctx->rc = -ENOENT;
+        ctx->done = true;
+        return;
+    }
+    
+    md_dev = &g_md_devices[raid_idx];
+    pthread_mutex_lock(&md_dev->lock);
+    pthread_mutex_unlock(&g_md_mutex);
+    
+    // 查找磁盘
+    int disk_idx = -1;
+    for (int i = 0; i < md_dev->disk_count; i++) {
+        if (md_dev->disk_names[i] && strcmp(md_dev->disk_names[i], ctx->disk_name) == 0) {
+            disk_idx = i;
+            break;
+        }
+    }
+    
+    if (disk_idx < 0) {
+        pthread_mutex_unlock(&md_dev->lock);
+        XBDEV_ERRLOG("找不到磁盘: %s\n", ctx->disk_name);
+        ctx->rc = -ENOENT;
+        ctx->done = true;
+        return;
+    }
+    
+    // 设置磁盘状态
+    if (ctx->is_faulty) {
+        // 标记为故障盘
+        if (!md_dev->disk_state[disk_idx]) {
+            pthread_mutex_unlock(&md_dev->lock);
+            XBDEV_WARNLOG("磁盘已处于故障状态: %s\n", ctx->disk_name);
+            ctx->rc = 0;
+            ctx->done = true;
+            return;
+        }
+        
+        md_dev->disk_state[disk_idx] = false;
+        md_dev->failed_disk_count++;
+        md_dev->degraded = true;
+        
+        XBDEV_NOTICELOG("已将磁盘标记为故障状态: %s\n", ctx->disk_name);
+    } else {
+        // 恢复磁盘正常状态
+        if (md_dev->disk_state[disk_idx]) {
+            pthread_mutex_unlock(&md_dev->lock);
+            XBDEV_WARNLOG("磁盘已处于正常状态: %s\n", ctx->disk_name);
+            ctx->rc = 0;
+            ctx->done = true;
+            return;
+        }
+        
+        md_dev->disk_state[disk_idx] = true;
+        if (md_dev->failed_disk_count > 0) {
+            md_dev->failed_disk_count--;
+        }
+        
+        // 如果没有更多故障盘，标记为非降级状态
+        if (md_dev->failed_disk_count == 0) {
+            md_dev->degraded = false;
+        }
+        
+        XBDEV_NOTICELOG("已恢复磁盘正常状态: %s\n", ctx->disk_name);
+    }
+    
+    pthread_mutex_unlock(&md_dev->lock);
+    
+    ctx->rc = 0;
+    ctx->done = true;
+}
+
+/**
+ * 设置磁盘为故障状态
+ * 
+ * @param md_name RAID设备名称
+ * @param disk_name 磁盘名称
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_set_faulty(const char *md_name, const char *disk_name)
+{
+    xbdev_request_t *req;
+    struct {
+        const char *md_name;
+        const char *disk_name;
+        bool is_faulty;
+        int rc;
+        bool done;
+    } ctx = {0};
+    int rc;
+    
+    // 参数检查
+    if (!md_name || !disk_name) {
+        XBDEV_ERRLOG("无效的参数\n");
+        return -EINVAL;
+    }
+    
+    // 设置上下文
+    ctx.md_name = md_name;
+    ctx.disk_name = disk_name;
+    ctx.is_faulty = true;
+    ctx.rc = 0;
+    ctx.done = false;
+    
+    // 分配请求
+    req = xbdev_sync_request_alloc();
+    if (!req) {
+        XBDEV_ERRLOG("无法分配请求\n");
+        return -ENOMEM;
+    }
+    
+    // 设置请求类型
+    req->type = XBDEV_REQ_RAID_SET_DISK_STATE;
+    req->ctx = &ctx;
+    
+    // 提交请求并等待完成
+    rc = xbdev_sync_request_execute(req);
+    if (rc != 0) {
+        XBDEV_ERRLOG("执行同步请求失败: %d\n", rc);
+        xbdev_sync_request_free(req);
+        return rc;
+    }
+    
+    // 检查操作结果
+    rc = ctx.rc;
+    if (rc != 0) {
+        XBDEV_ERRLOG("设置磁盘故障状态失败: %s, rc=%d\n", disk_name, rc);
+    }
+    
+    // 释放请求
+    xbdev_sync_request_free(req);
+    
+    return rc;
+}
+
+/**
+ * 恢复磁盘正常状态
+ * 
+ * @param md_name RAID设备名称
+ * @param disk_name 磁盘名称
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_set_normal(const char *md_name, const char *disk_name)
+{
+    xbdev_request_t *req;
+    struct {
+        const char *md_name;
+        const char *disk_name;
+        bool is_faulty;
+        int rc;
+        bool done;
+    } ctx = {0};
+    int rc;
+    
+    // 参数检查
+    if (!md_name || !disk_name) {
+        XBDEV_ERRLOG("无效的参数\n");
+        return -EINVAL;
+    }
+    
+    // 设置上下文
+    ctx.md_name = md_name;
+    ctx.disk_name = disk_name;
+    ctx.is_faulty = false;
+    ctx.rc = 0;
+    ctx.done = false;
+    
+    // 分配请求
+    req = xbdev_sync_request_alloc();
+    if (!req) {
+        XBDEV_ERRLOG("无法分配请求\n");
+        return -ENOMEM;
+    }
+    
+    // 设置请求类型
+    req->type = XBDEV_REQ_RAID_SET_DISK_STATE;
+    req->ctx = &ctx;
+    
+    // 提交请求并等待完成
+    rc = xbdev_sync_request_execute(req);
+    if (rc != 0) {
+        XBDEV_ERRLOG("执行同步请求失败: %d\n", rc);
+        xbdev_sync_request_free(req);
+        return rc;
+    }
+    
+    // 检查操作结果
+    rc = ctx.rc;
+    if (rc != 0) {
+        XBDEV_ERRLOG("恢复磁盘正常状态失败: %s, rc=%d\n", disk_name, rc);
+    }
+    
+    // 释放请求
+    xbdev_sync_request_free(req);
+    
+    return rc;
+}
+
+/**
+ * 获取RAID设备重建进度
+ * 
+ * @param md_name RAID设备名称
+ * @param progress 输出参数，重建进度 [0.0-100.0]
+ * @param active 输出参数，是否正在进行重建
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_get_rebuild_progress(const char *md_name, float *progress, bool *active)
+{
+    int raid_idx;
+    
+    // 参数检查
+    if (!md_name || !progress || !active) {
+        XBDEV_ERRLOG("无效的参数\n");
+        return -EINVAL;
+    }
+    
+    // 查找RAID设备
+    pthread_mutex_lock(&g_md_mutex);
+    raid_idx = find_md_by_name(md_name);
+    if (raid_idx < 0) {
+        pthread_mutex_unlock(&g_md_mutex);
+        XBDEV_ERRLOG("找不到RAID设备: %s\n", md_name);
+        return -ENOENT;
+    }
+    
+    xbdev_md_dev_t *md_dev = &g_md_devices[raid_idx];
+    pthread_mutex_lock(&md_dev->lock);
+    pthread_mutex_unlock(&g_md_mutex);
+    
+    // 获取重建信息
+    *active = md_dev->rebuild_active;
+    *progress = md_dev->rebuild_progress * 100.0f;
+    
+    pthread_mutex_unlock(&md_dev->lock);
+    
+    return 0;
+}
+
+/**
+ * 更新RAID模拟重建进度
+ * 该函数用于示例，实际应用中应由后台任务更新
+ * 
+ * @param md_name RAID设备名称
+ * @param progress 新的进度值 [0.0-1.0]
+ * @return 成功返回0，失败返回错误码
+ */
+int xbdev_md_update_rebuild_progress(const char *md_name, float progress)
+{
+    int raid_idx;
+    
+    // 参数检查
+    if (!md_name || progress < 0.0 || progress > 1.0) {
+        return -EINVAL;
+    }
+    
+    // 查找RAID设备
+    pthread_mutex_lock(&g_md_mutex);
+    raid_idx = find_md_by_name(md_name);
+    if (raid_idx < 0) {
+        pthread_mutex_unlock(&g_md_mutex);
+        return -ENOENT;
+    }
+    
+    xbdev_md_dev_t *md_dev = &g_md_devices[raid_idx];
+    pthread_mutex_lock(&md_dev->lock);
+    pthread_mutex_unlock(&g_md_mutex);
+    
+    // 更新重建进度
+    if (md_dev->rebuild_active) {
+        md_dev->rebuild_progress = progress;
+        
+        // 如果重建完成，设置状态
+        if (progress >= 1.0) {
+            md_dev->rebuild_active = false;
+            
+            // 如果没有更多故障盘，标记为非降级状态
+            if (md_dev->failed_disk_count == 0) {
+                md_dev->degraded = false;
+            }
+            
+            XBDEV_NOTICELOG("RAID设备重建已完成: %s\n", md_name);
+        }
+    }
+    
+    pthread_mutex_unlock(&md_dev->lock);
+    
+    return 0;
+}
+
+/**
+ * 列出所有RAID设备
+ * 
+ * @param md_names 输出参数，存储RAID设备名称的数组
+ * @param max_names 数组大小
+ * @return 成功返回找到的设备数量，失败返回错误码
+ */
+int xbdev_md_list(char **md_names, int max_names)
+{
+    int count = 0;
+    
+    // 参数检查
+    if (!md_names || max_names <= 0) {
+        XBDEV_ERRLOG("无效的参数\n");
+        return -EINVAL;
+    }
+    
+    pthread_mutex_lock(&g_md_mutex);
+    
+    for (int i = 0; i < XBDEV_MD_MAX_RAIDS && count < max_names; i++) {
+        if (g_md_devices[i].active) {
+            md_names[count] = strdup(g_md_devices[i].name);
+            if (!md_names[count]) {
+                pthread_mutex_unlock(&g_md_mutex);
+                
+                // 释放已分配的内存
+                for (int j = 0; j < count; j++) {
+                    free(md_names[j]);
+                }
+                
+                return -ENOMEM;
+            }
+            
+            count++;
+        }
+    }
+    
+    pthread_mutex_unlock(&g_md_mutex);
+    
+    return count;
+}
+
+/**
+ * 处理请求分派函数
+ * 根据请求类型调用对应的处理函数
+ * 
+ * @param req 请求对象
+ */
+void xbdev_md_dispatch_request(xbdev_request_t *req)
+{
+    // 根据请求类型分派处理
+    switch (req->type) {
+        case XBDEV_REQ_RAID_CREATE:
+            xbdev_md_create_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_STOP:
+            xbdev_md_stop_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_ASSEMBLE:
+            xbdev_md_assemble_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_EXAMINE:
+            xbdev_md_examine_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_DETAIL:
+            xbdev_md_detail_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_MANAGE:
+            xbdev_md_manage_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_REPLACE_DISK:
+            xbdev_md_replace_disk_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_REBUILD_CONTROL:
+            xbdev_md_rebuild_control_on_thread(req->ctx);
+            break;
+            
+        case XBDEV_REQ_RAID_SET_DISK_STATE:
+            xbdev_md_set_disk_state_on_thread(req->ctx);
+            break;
+            
+        default:
+            XBDEV_ERRLOG("未知的RAID请求类型: %d\n", req->type);
+            break;
+    }
+}

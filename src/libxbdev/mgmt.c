@@ -1,21 +1,29 @@
 /**
  * @file mgmt.c
- * @brief 实现管理服务器接口
- * 
- * 实现基于HTTP/JSON-RPC的管理服务器，提供远程管理和监控功能。
+ * @brief 管理接口实现
  */
 
 #include "xbdev.h"
 #include "xbdev_internal.h"
-#include "xbdev_mgmt.h"
+#include <spdk/jsonrpc.h>
+#include <spdk/rpc.h>
+#include <spdk/string.h>
+
+struct mgmt_server {
+    bool running;                    // 服务器是否运行
+    char *listen_addr;              // 监听地址
+    int port;                       // 监听端口
+    xbdev_notification_cb notify_cb;// 通知回调
+    void *notify_ctx;               // 回调上下文
+};
+
+static struct mgmt_server g_mgmt_server = {0};
+
 #include "xbdev_security.h"
 #include <spdk/thread.h>
 #include <spdk/log.h>
 #include <spdk/util.h>
 #include <spdk/bdev.h>
-#include <spdk/jsonrpc.h>
-#include <spdk/rpc.h>
-#include <spdk/string.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>

@@ -1,6 +1,9 @@
 /**
  * @file security.c
- * @brief 实现存储安全功能，包括加密和访问控制
+ * @brief 实现存储安全功能
+ *
+ * 该文件实现libxbdev的安全功能，包括卷加密、
+ * 访问控制和认证功能。
  */
 
 #include "xbdev.h"
@@ -9,84 +12,121 @@
 #include <spdk/thread.h>
 #include <spdk/log.h>
 #include <spdk/util.h>
-#include <spdk/bdev.h>
 #include <openssl/evp.h>
-#include <openssl/aes.h>
-#include <openssl/sha.h>
-#include <openssl/hmac.h>
 #include <openssl/rand.h>
-#include <time.h>
-#include <string.h>
+#include <openssl/sha.h>
+#include <openssl/err.h>
+#include <openssl/aes.h>
 #include <stdlib.h>
-#include <json-c/json.h>
+#include <string.h>
+#include <time.h>
+#include <assert.h>
 
-// 加密上下文结构
+/**
+ * 最大同时支持的加密卷数
+ */
+#define XBDEV_MAX_ENCRYPTED_VOLS 128
+
+/**
+ * 最大支持的访问令牌数
+ */
+#define XBDEV_MAX_TOKENS 256
+
+/**
+ * 加密上下文结构体
+ */
 typedef struct {
-    xbdev_encryption_algorithm_t algorithm;
-    uint8_t key[64];            // 加密密钥
-    uint32_t key_size;          // 密钥大小（字节）
-    uint8_t iv[16];             // 初始化向量
-    EVP_CIPHER_CTX *ctx;        // OpenSSL加密上下文
-    uint32_t sector_size;       // 扇区大小
-    bool enabled;               // 是否启用
+    xbdev_encryption_algorithm_t algorithm;    // 加密算法
+    xbdev_key_derive_method_t key_method;      // 密钥派生方法
+    bool enabled;                              // 是否启用
+    uint32_t sector_size;                      // 加密扇区大小
+    uint8_t key[64];                           // 加密密钥
+    uint32_t key_size;                         // 密钥长度 (128/256位等)
+    uint8_t iv[16];                            // 初始化向量
+    EVP_CIPHER_CTX *cipher_ctx;                // OpenSSL加密上下文
 } xbdev_crypto_ctx_t;
 
-// 卷加密表
-#define XBDEV_MAX_ENCRYPTED_VOLS 64
-static struct {
-    char lvol_name[64];
-    xbdev_crypto_ctx_t crypto_ctx;
-    bool in_use;
-} g_encrypted_vols[XBDEV_MAX_ENCRYPTED_VOLS];
-static pthread_mutex_t g_crypto_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// 访问控制配置
-static xbdev_access_control_t g_access_control = {
-    .mode = XBDEV_ACCESS_MODE_OPEN
-};
-static pthread_mutex_t g_access_control_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// 令牌结构
+/**
+ * 加密卷表项结构体
+ */
 typedef struct {
-    char username[64];
-    char token[256];
-    time_t expiry;
-    bool in_use;
+    bool in_use;                               // 是否正在使用
+    char lvol_name[256];                       // 逻辑卷名称
+    xbdev_crypto_ctx_t crypto_ctx;             // 加密上下文
+} xbdev_encrypted_vol_t;
+
+/**
+ * 令牌结构体
+ */
+typedef struct {
+    bool in_use;                               // 是否正在使用
+    char username[64];                         // 用户名
+    char token[256];                           // 令牌值
+    time_t expiry;                             // 过期时间
 } xbdev_token_t;
 
-// 令牌管理
-#define XBDEV_MAX_TOKENS 256
+/**
+ * 全局加密卷表
+ */
+static xbdev_encrypted_vol_t g_encrypted_vols[XBDEV_MAX_ENCRYPTED_VOLS];
+
+/**
+ * 全局加密互斥锁
+ */
+static pthread_mutex_t g_crypto_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * 全局访问控制配置
+ */
+static xbdev_access_control_t g_access_control = {
+    .mode = XBDEV_ACCESS_MODE_OPEN,  // 默认开放模式
+    .audit_logging = false           // 默认不启用审计
+};
+
+/**
+ * 全局访问控制互斥锁
+ */
+static pthread_mutex_t g_access_control_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * 全局令牌表
+ */
 static xbdev_token_t g_tokens[XBDEV_MAX_TOKENS];
+
+/**
+ * 全局令牌互斥锁
+ */
 static pthread_mutex_t g_token_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * 初始化安全模块
  */
-int xbdev_security_init(void) {
-    memset(g_encrypted_vols, 0, sizeof(g_encrypted_vols));
-    memset(g_tokens, 0, sizeof(g_tokens));
-    pthread_mutex_init(&g_crypto_mutex, NULL);
-    pthread_mutex_init(&g_access_control_mutex, NULL);
-    pthread_mutex_init(&g_token_mutex, NULL);
-    
-    // 初始化OpenSSL
+int xbdev_security_init(void)
+{
+    // 初始化OpenSSL库
     OpenSSL_add_all_algorithms();
     
-    XBDEV_NOTICELOG("安全模块已初始化\n");
+    // 初始化加密卷表
+    memset(g_encrypted_vols, 0, sizeof(g_encrypted_vols));
+    
+    // 初始化令牌表
+    memset(g_tokens, 0, sizeof(g_tokens));
+    
     return 0;
 }
 
 /**
  * 清理安全模块
  */
-void xbdev_security_fini(void) {
+void xbdev_security_fini(void)
+{
     pthread_mutex_lock(&g_crypto_mutex);
     
     // 清理所有加密上下文
     for (int i = 0; i < XBDEV_MAX_ENCRYPTED_VOLS; i++) {
-        if (g_encrypted_vols[i].in_use && g_encrypted_vols[i].crypto_ctx.ctx) {
-            EVP_CIPHER_CTX_free(g_encrypted_vols[i].crypto_ctx.ctx);
-            g_encrypted_vols[i].crypto_ctx.ctx = NULL;
+        if (g_encrypted_vols[i].in_use && g_encrypted_vols[i].crypto_ctx.cipher_ctx) {
+            EVP_CIPHER_CTX_free(g_encrypted_vols[i].crypto_ctx.cipher_ctx);
+            g_encrypted_vols[i].crypto_ctx.cipher_ctx = NULL;
         }
     }
     
@@ -94,51 +134,66 @@ void xbdev_security_fini(void) {
     
     // 清理OpenSSL
     EVP_cleanup();
-    
-    // 销毁互斥锁
-    pthread_mutex_destroy(&g_crypto_mutex);
-    pthread_mutex_destroy(&g_access_control_mutex);
-    pthread_mutex_destroy(&g_token_mutex);
-    
-    XBDEV_NOTICELOG("安全模块已清理\n");
 }
 
 /**
- * 查找卷加密上下文
+ * 查找加密上下文
  */
-static xbdev_crypto_ctx_t *find_crypto_ctx(const char *lvol_name) {
+static xbdev_crypto_ctx_t* find_crypto_ctx(const char *lvol_name)
+{
     for (int i = 0; i < XBDEV_MAX_ENCRYPTED_VOLS; i++) {
         if (g_encrypted_vols[i].in_use && 
             strcmp(g_encrypted_vols[i].lvol_name, lvol_name) == 0) {
             return &g_encrypted_vols[i].crypto_ctx;
         }
     }
+    
     return NULL;
 }
 
 /**
- * 分配新的卷加密上下文
+ * 分配新的加密上下文
  */
-static xbdev_crypto_ctx_t *alloc_crypto_ctx(const char *lvol_name) {
-    for (int i = 0; i < XBDEV_MAX_ENCRYPTED_VOLS; i++) {
-        if (!g_encrypted_vols[i].in_use) {
-            g_encrypted_vols[i].in_use = true;
-            strncpy(g_encrypted_vols[i].lvol_name, lvol_name, sizeof(g_encrypted_vols[i].lvol_name) - 1);
-            return &g_encrypted_vols[i].crypto_ctx;
-        }
-    }
-    return NULL;
-}
-
-/**
- * 释放卷加密上下文
- */
-static void free_crypto_ctx(const char *lvol_name) {
+static xbdev_crypto_ctx_t* alloc_crypto_ctx(const char *lvol_name)
+{
+    int free_idx = -1;
+    
+    // 先查找是否已存在
     for (int i = 0; i < XBDEV_MAX_ENCRYPTED_VOLS; i++) {
         if (g_encrypted_vols[i].in_use && 
             strcmp(g_encrypted_vols[i].lvol_name, lvol_name) == 0) {
-            if (g_encrypted_vols[i].crypto_ctx.ctx) {
-                EVP_CIPHER_CTX_free(g_encrypted_vols[i].crypto_ctx.ctx);
+            return &g_encrypted_vols[i].crypto_ctx;
+        }
+        
+        // 记录第一个空闲项
+        if (free_idx == -1 && !g_encrypted_vols[i].in_use) {
+            free_idx = i;
+        }
+    }
+    
+    // 如果没有找到空闲
+    if (free_idx == -1) {
+        return NULL;
+    }
+    
+    // 初始化新项
+    g_encrypted_vols[free_idx].in_use = true;
+    strncpy(g_encrypted_vols[free_idx].lvol_name, lvol_name, sizeof(g_encrypted_vols[free_idx].lvol_name) - 1);
+    g_encrypted_vols[free_idx].lvol_name[sizeof(g_encrypted_vols[free_idx].lvol_name) - 1] = '\0';
+    
+    return &g_encrypted_vols[free_idx].crypto_ctx;
+}
+
+/**
+ * 释放加密上下文
+ */
+static void free_crypto_ctx(const char *lvol_name)
+{
+    for (int i = 0; i < XBDEV_MAX_ENCRYPTED_VOLS; i++) {
+        if (g_encrypted_vols[i].in_use && 
+            strcmp(g_encrypted_vols[i].lvol_name, lvol_name) == 0) {
+            if (g_encrypted_vols[i].crypto_ctx.cipher_ctx) {
+                EVP_CIPHER_CTX_free(g_encrypted_vols[i].crypto_ctx.cipher_ctx);
             }
             memset(&g_encrypted_vols[i], 0, sizeof(g_encrypted_vols[i]));
             break;
@@ -151,7 +206,8 @@ static void free_crypto_ctx(const char *lvol_name) {
  */
 static int derive_key(const char *passphrase, xbdev_key_derive_method_t method,
                      const uint8_t *salt, uint32_t salt_length, 
-                     uint32_t iterations, uint8_t *key, uint32_t key_size) {
+                     uint32_t iterations, uint8_t *key, uint32_t key_size)
+{
     switch (method) {
         case XBDEV_KEY_DERIVE_NONE:
             // 直接使用passphrase作为密钥（通常不推荐）
@@ -188,7 +244,8 @@ static int derive_key(const char *passphrase, xbdev_key_derive_method_t method,
  * 初始化加密上下文
  */
 static int init_crypto_ctx(xbdev_crypto_ctx_t *ctx, xbdev_encryption_algorithm_t algorithm,
-                          const uint8_t *key, uint32_t key_size, uint32_t sector_size) {
+                          const uint8_t *key, uint32_t key_size, uint32_t sector_size)
+{
     const EVP_CIPHER *cipher = NULL;
     
     // 选择加密算法
@@ -221,8 +278,8 @@ static int init_crypto_ctx(xbdev_crypto_ctx_t *ctx, xbdev_encryption_algorithm_t
     }
     
     // 创建加密上下文
-    ctx->ctx = EVP_CIPHER_CTX_new();
-    if (!ctx->ctx) {
+    ctx->cipher_ctx = EVP_CIPHER_CTX_new();
+    if (!ctx->cipher_ctx) {
         XBDEV_ERRLOG("无法创建加密上下文\n");
         return -ENOMEM;
     }
@@ -237,8 +294,8 @@ static int init_crypto_ctx(xbdev_crypto_ctx_t *ctx, xbdev_encryption_algorithm_t
     // 生成随机初始化向量
     if (RAND_bytes(ctx->iv, sizeof(ctx->iv)) != 1) {
         XBDEV_ERRLOG("生成随机IV失败\n");
-        EVP_CIPHER_CTX_free(ctx->ctx);
-        ctx->ctx = NULL;
+        EVP_CIPHER_CTX_free(ctx->cipher_ctx);
+        ctx->cipher_ctx = NULL;
         return -EINVAL;
     }
     
@@ -248,7 +305,8 @@ static int init_crypto_ctx(xbdev_crypto_ctx_t *ctx, xbdev_encryption_algorithm_t
 /**
  * 为卷启用加密
  */
-int xbdev_encryption_enable(const char *lvol_name, const xbdev_encryption_config_t *config) {
+int xbdev_encryption_enable(const char *lvol_name, const xbdev_encryption_config_t *config)
+{
     int rc;
     xbdev_crypto_ctx_t *crypto_ctx;
     uint8_t key[64] = {0};
@@ -322,7 +380,8 @@ int xbdev_encryption_enable(const char *lvol_name, const xbdev_encryption_config
 /**
  * 禁用卷加密
  */
-int xbdev_encryption_disable(const char *lvol_name, const char *passphrase) {
+int xbdev_encryption_disable(const char *lvol_name, const char *passphrase)
+{
     // 此函数会验证密码并移除加密
     // 实际上这需要重新写入整个卷的数据（先解密再写回）
     // 此处只是简单地移除加密上下文
@@ -356,7 +415,8 @@ int xbdev_encryption_disable(const char *lvol_name, const char *passphrase) {
 /**
  * 更改卷加密密钥
  */
-int xbdev_encryption_change_key(const char *lvol_name, const char *old_passphrase, const char *new_passphrase) {
+int xbdev_encryption_change_key(const char *lvol_name, const char *old_passphrase, const char *new_passphrase)
+{
     // 实现密钥更改逻辑
     // 此处暂未实现
     XBDEV_WARNLOG("卷加密密钥更改功能暂未实现\n");
@@ -366,7 +426,8 @@ int xbdev_encryption_change_key(const char *lvol_name, const char *old_passphras
 /**
  * 获取卷加密状态
  */
-int xbdev_encryption_get_status(const char *lvol_name, bool *is_encrypted, xbdev_encryption_algorithm_t *algorithm) {
+int xbdev_encryption_get_status(const char *lvol_name, bool *is_encrypted, xbdev_encryption_algorithm_t *algorithm)
+{
     if (!lvol_name || !is_encrypted) {
         return -EINVAL;
     }
@@ -395,7 +456,8 @@ int xbdev_encryption_get_status(const char *lvol_name, bool *is_encrypted, xbdev
 /**
  * 配置管理服务器访问控制
  */
-int xbdev_mgmt_set_access_control(const xbdev_access_control_t *config) {
+int xbdev_mgmt_set_access_control(const xbdev_access_control_t *config)
+{
     if (!config) {
         return -EINVAL;
     }
@@ -446,7 +508,8 @@ int xbdev_mgmt_set_access_control(const xbdev_access_control_t *config) {
 /**
  * 验证管理访问凭据
  */
-int xbdev_mgmt_authenticate(const char *username, const char *password) {
+int xbdev_mgmt_authenticate(const char *username, const char *password)
+{
     int rc = -EACCES;  // 默认拒绝访问
     
     if (!username || !password) {
@@ -528,7 +591,8 @@ int xbdev_mgmt_authenticate(const char *username, const char *password) {
 /**
  * 生成随机令牌
  */
-static void generate_random_token(char *token_buf, size_t buf_size) {
+static void generate_random_token(char *token_buf, size_t buf_size)
+{
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     if (buf_size < 32) return;
     
@@ -547,7 +611,8 @@ static void generate_random_token(char *token_buf, size_t buf_size) {
  * 生成新访问令牌
  */
 int xbdev_mgmt_generate_token(const char *username, const char *password, 
-                             char *token_buf, size_t buf_size, uint32_t expiry_seconds) {
+                             char *token_buf, size_t buf_size, uint32_t expiry_seconds)
+{
     if (!username || !password || !token_buf || buf_size < 32) {
         return -EINVAL;
     }
@@ -611,7 +676,8 @@ int xbdev_mgmt_generate_token(const char *username, const char *password,
  * @param encrypt true表示加密，false表示解密
  * @return 成功返回0，失败返回错误码
  */
-int xbdev_encrypt_io(struct spdk_bdev_io *bdev_io, bool encrypt) {
+int xbdev_encrypt_io(struct spdk_bdev_io *bdev_io, bool encrypt)
+{
     // TODO: 实现IO数据的加密和解密
     // 流程：
     // 1. 获取IO请求的卷名
@@ -625,7 +691,8 @@ int xbdev_encrypt_io(struct spdk_bdev_io *bdev_io, bool encrypt) {
 /**
  * 导出安全配置到JSON
  */
-int xbdev_security_export_config(struct json_object *config_obj) {
+int xbdev_security_export_config(struct json_object *config_obj)
+{
     // 导出加密卷配置
     struct json_object *encrypted_vols = json_object_new_array();
     
@@ -680,7 +747,8 @@ int xbdev_security_export_config(struct json_object *config_obj) {
 /**
  * 从JSON导入安全配置
  */
-int xbdev_security_import_config(struct json_object *config_obj) {
+int xbdev_security_import_config(struct json_object *config_obj)
+{
     struct json_object *encrypted_vols = NULL;
     struct json_object *access_control = NULL;
     int rc = 0;
@@ -773,7 +841,8 @@ int xbdev_security_import_config(struct json_object *config_obj) {
  * @param result 操作结果(0=成功, 非0=失败)
  */
 void xbdev_security_audit_log(const char *username, const char *action, 
-                            const char *target, int result) {
+                            const char *target, int result)
+{
     // 检查是否启用审计日志
     if (!g_access_control.audit_logging) {
         return;
@@ -815,7 +884,8 @@ void xbdev_security_audit_log(const char *username, const char *action,
  * @param ip_addr 待检查的IP地址
  * @return true=允许访问, false=禁止访问
  */
-bool xbdev_security_check_ip(const char *ip_addr) {
+bool xbdev_security_check_ip(const char *ip_addr)
+{
     if (!ip_addr) {
         return false;
     }
@@ -861,7 +931,8 @@ bool xbdev_security_check_ip(const char *ip_addr) {
  * @param username 待检查的用户名
  * @return true=允许访问, false=禁止访问
  */
-bool xbdev_security_check_user(const char *username) {
+bool xbdev_security_check_user(const char *username)
+{
     if (!username) {
         return false;
     }
@@ -904,7 +975,8 @@ bool xbdev_security_check_user(const char *username) {
 /**
  * 清理过期令牌
  */
-void xbdev_security_cleanup_tokens(void) {
+void xbdev_security_cleanup_tokens(void)
+{
     time_t now = time(NULL);
     int cleaned = 0;
     
